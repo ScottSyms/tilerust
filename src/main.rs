@@ -77,7 +77,8 @@ fn generate_tile(zoom: u32, x: u32, y: u32, tree: &RTree<DataPoint>) -> Vec<u8> 
     let mut img = ImageBuffer::<Rgba<u8>, Vec<u8>>::new(width, height);
     if max_count > 0 {
         for (i, cnt) in counts.into_iter().enumerate() {
-            let val = cnt as f32 / max_count as f32;
+            // Use a logarithmic scale so areas of high density ramp up toward red
+            let val = (cnt as f32).ln_1p() / (max_count as f32).ln_1p();
             let color = color_map(val);
             let x = (i as u32) % width;
             let y = (i as u32) / width;
@@ -100,7 +101,9 @@ fn color_map(v: f32) -> Rgba<u8> {
     if !v.is_finite() || v <= 0.0 {
         return Rgba([0, 0, 0, 0]);
     }
-    let r = (255.0 * v) as u8;
+    // Intensify red as density increases
+    let intensity = v.powf(0.5).clamp(0.0, 1.0);
+    let r = (255.0 * intensity) as u8;
     let b = 255 - r;
     Rgba([r, 0, b, 255])
 }
