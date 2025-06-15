@@ -24,7 +24,7 @@ impl RTreeObject for DataPoint {
 }
 
 struct AppState {
-    base_path: String,
+    tree: RTree<DataPoint>,
 }
 
 fn tile2mercator(xtile: u32, ytile: u32, zoom: u32) -> (f64, f64) {
@@ -161,17 +161,16 @@ async fn index() -> impl Responder {
 #[get("/tiles/{zoom}/{x}/{y}.png")]
 async fn tile(path: web::Path<(u32, u32, u32)>, data: web::Data<AppState>) -> HttpResponse {
     let (z, x, y) = path.into_inner();
-    let points = load_points_from_dir(&data.base_path);
-    let tree = RTree::bulk_load(points);
-    let img = generate_tile(z, x, y, &tree);
+    let img = generate_tile(z, x, y, &data.tree);
     HttpResponse::Ok().content_type("image/png").body(img)
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let data = web::Data::new(AppState {
-        base_path: String::from("partition"),
-    });
+    let base_path = "partition";
+    let points = load_points_from_dir(base_path);
+    let tree = RTree::bulk_load(points);
+    let data = web::Data::new(AppState { tree });
 
     HttpServer::new(move || {
         App::new()
