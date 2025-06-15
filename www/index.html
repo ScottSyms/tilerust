@@ -111,6 +111,12 @@ var toner = L.tileLayer('http://tile.stamen.com/toner/{z}/{x}/{y}.png', {
         document.getElementById('apply').addEventListener('click', function() {
             var start = document.getElementById('start').value;
             var end = document.getElementById('end').value;
+            if (start) {
+                start = start + 'T00:00:00Z';
+            }
+            if (end) {
+                end = end + 'T23:59:59Z';
+            }
             var loading = document.getElementById('loading');
             loading.style.display = 'block';
             fetch('/range?start=' + encodeURIComponent(start) + '&end=' + encodeURIComponent(end))
