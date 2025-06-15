@@ -9,6 +9,10 @@ use image::{ImageBuffer, Rgba};
 use serde::Deserialize;
 use walkdir::WalkDir;
 
+fn is_debug() -> bool {
+    std::env::var("DEBUG").map(|v| v == "1").unwrap_or(false)
+}
+
 #[derive(Clone, Copy, Debug, Deserialize)]
 struct DataPoint {
     x: f64,
@@ -109,6 +113,10 @@ fn color_map(v: f32) -> Rgba<u8> {
 }
 
 fn load_points_from_dir<P: AsRef<Path>>(dir: P) -> Vec<DataPoint> {
+    let debug = is_debug();
+    if debug {
+        println!("Scanning directory {}", dir.as_ref().display());
+    }
     let mut points = Vec::new();
     for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
         if entry
@@ -118,13 +126,16 @@ fn load_points_from_dir<P: AsRef<Path>>(dir: P) -> Vec<DataPoint> {
             .map(|e| e.eq_ignore_ascii_case("parquet"))
             .unwrap_or(false)
         {
+            if debug {
+                println!("Reading file {}", entry.path().display());
+            }
             if let Ok(file) = File::open(entry.path()) {
                 if let Ok(reader) = SerializedFileReader::new(file) {
                     if let Ok(iter) = reader.get_row_iter(None) {
                         for record in iter {
                             if let Ok(row) = record {
-                                let x = get_f64_by_name(&row, "longitude").unwrap_or(0.0);
-                                let y = get_f64_by_name(&row, "latitude").unwrap_or(0.0);
+                                let x = get_f64_by_name(&row, "X").unwrap_or(0.0);
+                                let y = get_f64_by_name(&row, "Y").unwrap_or(0.0);
                                 points.push(DataPoint { x, y });
                             }
                         }
@@ -132,6 +143,9 @@ fn load_points_from_dir<P: AsRef<Path>>(dir: P) -> Vec<DataPoint> {
                 }
             }
         }
+    }
+    if debug {
+        println!("Loaded {} points", points.len());
     }
     points
 }
@@ -161,6 +175,9 @@ async fn index() -> impl Responder {
 #[get("/tiles/{zoom}/{x}/{y}.png")]
 async fn tile(path: web::Path<(u32, u32, u32)>, data: web::Data<AppState>) -> HttpResponse {
     let (z, x, y) = path.into_inner();
+    if is_debug() {
+        println!("Serving tile z={}, x={}, y={}", z, x, y);
+    }
     let points = load_points_from_dir(&data.base_path);
     let tree = RTree::bulk_load(points);
     let img = generate_tile(z, x, y, &tree);
@@ -172,6 +189,9 @@ async fn main() -> std::io::Result<()> {
     let data = web::Data::new(AppState {
         base_path: String::from("partition"),
     });
+    if is_debug() {
+        println!("Starting server using data directory 'partition'");
+    }
 
     HttpServer::new(move || {
         App::new()
