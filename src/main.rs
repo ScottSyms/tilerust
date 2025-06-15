@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::path::Path;
-use chrono::{DateTime, Duration, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use actix_files as fs;
 use actix_web::{get, web, App, HttpResponse, HttpServer, Responder};
 use std::sync::{Arc, Mutex};
@@ -239,6 +239,22 @@ fn get_datetime_by_name(row: &parquet::record::Row, name: &str) -> Option<DateTi
     None
 }
 
+fn parse_input_datetime(s: &str, end_of_day: bool) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.with_timezone(&Utc))
+        .or_else(|_| {
+            NaiveDate::parse_from_str(s, "%Y-%m-%d").map(|d| {
+                let dt = if end_of_day {
+                    d.and_hms_opt(23, 59, 59).unwrap()
+                } else {
+                    d.and_hms_opt(0, 0, 0).unwrap()
+                };
+                DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc)
+            })
+        })
+        .ok()
+}
+
 #[get("/")]
 async fn index() -> impl Responder {
     debug_log!("serving index.html");
@@ -265,13 +281,11 @@ async fn range(query: web::Query<RangeParams>, data: web::Data<AppState>) -> Htt
     let start = query
         .start
         .as_deref()
-        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-        .map(|dt| dt.with_timezone(&Utc));
+        .and_then(|s| parse_input_datetime(s, false));
     let end = query
         .end
         .as_deref()
-        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-        .map(|dt| dt.with_timezone(&Utc));
+        .and_then(|s| parse_input_datetime(s, true));
     let points = load_points_from_dir("partition", start, end);
     let tree = RTree::bulk_load(points);
     {
