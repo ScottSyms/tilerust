@@ -10,6 +10,18 @@ use image::{ImageBuffer, Rgba};
 use serde::Deserialize;
 use walkdir::WalkDir;
 
+fn debug_enabled() -> bool {
+    std::env::var("DEBUG").map(|v| v == "1").unwrap_or(false)
+}
+
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        if debug_enabled() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
 #[derive(Clone, Copy, Debug, Deserialize)]
 struct DataPoint {
     x: f64,
@@ -29,14 +41,18 @@ struct AppState {
 }
 
 fn tile2mercator(xtile: u32, ytile: u32, zoom: u32) -> (f64, f64) {
+    debug_log!("tile2mercator xtile={} ytile={} zoom={}", xtile, ytile, zoom);
     let n = 2f64.powi(zoom as i32);
     let lon_deg = xtile as f64 / n * 360.0 - 180.0;
     let lat_rad = ((std::f64::consts::PI * (1.0 - 2.0 * ytile as f64 / n)).sinh()).atan();
     let lat_deg = lat_rad.to_degrees();
-    lnglat_to_meters(lon_deg, lat_deg)
+    let res = lnglat_to_meters(lon_deg, lat_deg);
+    debug_log!("tile2mercator result lon={} lat={} -> ({}, {})", lon_deg, lat_deg, res.0, res.1);
+    res
 }
 
 fn lnglat_to_meters(lon: f64, lat: f64) -> (f64, f64) {
+    debug_log!("lnglat_to_meters lon={} lat={}", lon, lat);
     // Web Mercator projection (EPSG:3857) conversion
     let origin_shift = std::f64::consts::PI * 6378137.0;
 
@@ -50,19 +66,23 @@ fn lnglat_to_meters(lon: f64, lat: f64) -> (f64, f64) {
         * origin_shift
         / std::f64::consts::PI;
 
+    debug_log!("lnglat_to_meters result -> ({}, {})", x, y);
     (x, y)
 }
 
 fn generate_tile(zoom: u32, x: u32, y: u32, tree: &RTree<DataPoint>) -> Vec<u8> {
+    debug_log!("generate_tile z={} x={} y={}", zoom, x, y);
     let (xleft, ytop) = tile2mercator(x, y, zoom);
     let (xright, ybottom) = tile2mercator(x + 1, y + 1, zoom);
 
     let bbox = AABB::from_corners([xleft, ybottom], [xright, ytop]);
+    debug_log!("bbox: [{}, {}]-[{}, {}]", xleft, ybottom, xright, ytop);
     let points = tree.locate_in_envelope(&bbox);
 
     let width = 256u32;
     let height = 256u32;
     let mut counts = vec![0u32; (width * height) as usize];
+    let mut point_count = 0u32;
 
     for p in points {
         let px = ((p.x - xleft) / (xright - xleft) * width as f64) as i32;
@@ -71,9 +91,13 @@ fn generate_tile(zoom: u32, x: u32, y: u32, tree: &RTree<DataPoint>) -> Vec<u8> 
             let idx = (py as u32 * width + px as u32) as usize;
             counts[idx] += 1;
         }
+        point_count += 1;
     }
 
+    debug_log!("points processed: {}", point_count);
+
     let max_count = counts.iter().copied().max().unwrap_or(0);
+    debug_log!("max_count={}", max_count);
 
     let mut img = ImageBuffer::<Rgba<u8>, Vec<u8>>::new(width, height);
     if max_count > 0 {
@@ -106,10 +130,12 @@ fn color_map(v: f32) -> Rgba<u8> {
     let intensity = v.powf(0.5).clamp(0.0, 1.0);
     let r = (255.0 * intensity) as u8;
     let b = 255 - r;
+    debug_log!("color_map v={} -> r={} b={}", v, r, b);
     Rgba([r, 0, b, 255])
 }
 
 fn load_points_from_dir<P: AsRef<Path>>(dir: P) -> Vec<DataPoint> {
+    debug_log!("loading points from {:?}", dir.as_ref());
     let mut all_points: Vec<(DataPoint, DateTime<Utc>)> = Vec::new();
     let mut max_time: Option<DateTime<Utc>> = None;
 
@@ -121,6 +147,7 @@ fn load_points_from_dir<P: AsRef<Path>>(dir: P) -> Vec<DataPoint> {
             .map(|e| e.eq_ignore_ascii_case("parquet"))
             .unwrap_or(false)
         {
+            debug_log!("processing file {:?}", entry.path());
             if let Ok(file) = File::open(entry.path()) {
                 if let Ok(reader) = SerializedFileReader::new(file) {
                     if let Ok(iter) = reader.get_row_iter(None) {
@@ -132,6 +159,7 @@ fn load_points_from_dir<P: AsRef<Path>>(dir: P) -> Vec<DataPoint> {
                                     if max_time.map(|m| ts > m).unwrap_or(true) {
                                         max_time = Some(ts);
                                     }
+                                    debug_log!("row x={} y={} ts={:?}", x, y, ts);
                                     all_points.push((DataPoint { x, y }, ts));
                                 }
                             }
@@ -143,12 +171,15 @@ fn load_points_from_dir<P: AsRef<Path>>(dir: P) -> Vec<DataPoint> {
     }
     if let Some(max_time) = max_time {
         let cutoff = max_time - Duration::hours(24);
-        all_points
+        let result: Vec<DataPoint> = all_points
             .into_iter()
             .filter(|(_, ts)| *ts >= cutoff)
             .map(|(pt, _)| pt)
-            .collect()
+            .collect();
+        debug_log!("points within 24h: {}", result.len());
+        result
     } else {
+        debug_log!("no points found");
         Vec::new()
     }
 }
@@ -156,7 +187,7 @@ fn load_points_from_dir<P: AsRef<Path>>(dir: P) -> Vec<DataPoint> {
 fn get_f64_by_name(row: &parquet::record::Row, name: &str) -> Option<f64> {
     for (n, field) in row.get_column_iter() {
         if n == name {
-            return match field {
+            let res = match field {
                 Field::Double(v) => Some(*v),
                 Field::Float(v) => Some(*v as f64),
                 Field::Int(v) => Some(*v as f64),
@@ -165,6 +196,8 @@ fn get_f64_by_name(row: &parquet::record::Row, name: &str) -> Option<f64> {
                 Field::ULong(v) => Some(*v as f64),
                 _ => None,
             };
+            debug_log!("get_f64_by_name {} -> {:?}", name, res);
+            return res;
         }
     }
     None
@@ -173,7 +206,7 @@ fn get_f64_by_name(row: &parquet::record::Row, name: &str) -> Option<f64> {
 fn get_datetime_by_name(row: &parquet::record::Row, name: &str) -> Option<DateTime<Utc>> {
     for (n, field) in row.get_column_iter() {
         if n == name {
-            return match field {
+            let res = match field {
                 Field::TimestampMillis(v) => DateTime::from_timestamp_millis(*v).map(|dt| dt.with_timezone(&Utc)),
                 Field::TimestampMicros(v) => DateTime::from_timestamp_micros(*v).map(|dt| dt.with_timezone(&Utc)),
                 Field::Int(v) => DateTime::from_timestamp(*v as i64, 0).map(|dt| dt.with_timezone(&Utc)),
@@ -193,6 +226,8 @@ fn get_datetime_by_name(row: &parquet::record::Row, name: &str) -> Option<DateTi
                 }
                 _ => None,
             };
+            debug_log!("get_datetime_by_name {} -> {:?}", name, res);
+            return res;
         }
     }
     None
@@ -200,20 +235,24 @@ fn get_datetime_by_name(row: &parquet::record::Row, name: &str) -> Option<DateTi
 
 #[get("/")]
 async fn index() -> impl Responder {
+    debug_log!("serving index.html");
     fs::NamedFile::open("./www/index.html")
 }
 
 #[get("/tiles/{zoom}/{x}/{y}.png")]
 async fn tile(path: web::Path<(u32, u32, u32)>, data: web::Data<AppState>) -> HttpResponse {
     let (z, x, y) = path.into_inner();
+    debug_log!("tile request z={} x={} y={}", z, x, y);
     let img = generate_tile(z, x, y, &data.tree);
     HttpResponse::Ok().content_type("image/png").body(img)
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    debug_log!("starting server");
     let base_path = "partition";
     let points = load_points_from_dir(base_path);
+    debug_log!("loaded {} points", points.len());
     let tree = RTree::bulk_load(points);
     let data = web::Data::new(AppState { tree });
 
