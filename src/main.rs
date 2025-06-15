@@ -3,6 +3,7 @@ use std::path::Path;
 use chrono::{DateTime, Duration, NaiveDateTime, TimeZone, Utc};
 use actix_files as fs;
 use actix_web::{get, web, App, HttpResponse, HttpServer, Responder};
+use std::sync::{Arc, Mutex};
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::record::Field;
 use rstar::{RTree, RTreeObject, AABB};
@@ -37,7 +38,7 @@ impl RTreeObject for DataPoint {
 }
 
 struct AppState {
-    tree: RTree<DataPoint>,
+    tree: Arc<Mutex<RTree<DataPoint>>>,
 }
 
 fn tile2mercator(xtile: u32, ytile: u32, zoom: u32) -> (f64, f64) {
@@ -134,8 +135,12 @@ fn color_map(v: f32) -> Rgba<u8> {
     Rgba([r, 0, b, 255])
 }
 
-fn load_points_from_dir<P: AsRef<Path>>(dir: P) -> Vec<DataPoint> {
-    debug_log!("loading points from {:?}", dir.as_ref());
+fn load_points_from_dir<P: AsRef<Path>>(
+    dir: P,
+    start: Option<DateTime<Utc>>,
+    end: Option<DateTime<Utc>>,
+) -> Vec<DataPoint> {
+    debug_log!("loading points from {:?} start={:?} end={:?}", dir.as_ref(), start, end);
     let mut all_points: Vec<(DataPoint, DateTime<Utc>)> = Vec::new();
     let mut max_time: Option<DateTime<Utc>> = None;
 
@@ -169,14 +174,15 @@ fn load_points_from_dir<P: AsRef<Path>>(dir: P) -> Vec<DataPoint> {
             }
         }
     }
-    if let Some(max_time) = max_time {
-        let cutoff = max_time - Duration::hours(24);
+    if let Some(max) = max_time {
+        let end_time = end.unwrap_or(max);
+        let start_time = start.unwrap_or(end_time - Duration::hours(24));
         let result: Vec<DataPoint> = all_points
             .into_iter()
-            .filter(|(_, ts)| *ts >= cutoff)
+            .filter(|(_, ts)| *ts >= start_time && *ts <= end_time)
             .map(|(pt, _)| pt)
             .collect();
-        debug_log!("points within 24h: {}", result.len());
+        debug_log!("points in range: {}", result.len());
         result
     } else {
         debug_log!("no points found");
@@ -243,17 +249,45 @@ async fn index() -> impl Responder {
 async fn tile(path: web::Path<(u32, u32, u32)>, data: web::Data<AppState>) -> HttpResponse {
     let (z, x, y) = path.into_inner();
     debug_log!("tile request z={} x={} y={}", z, x, y);
-    let img = generate_tile(z, x, y, &data.tree);
+    let tree = data.tree.lock().unwrap();
+    let img = generate_tile(z, x, y, &tree);
     HttpResponse::Ok().content_type("image/png").body(img)
+}
+
+#[derive(Deserialize)]
+struct RangeParams {
+    start: Option<String>,
+    end: Option<String>,
+}
+
+#[get("/range")]
+async fn range(query: web::Query<RangeParams>, data: web::Data<AppState>) -> HttpResponse {
+    let start = query
+        .start
+        .as_deref()
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&Utc));
+    let end = query
+        .end
+        .as_deref()
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&Utc));
+    let points = load_points_from_dir("partition", start, end);
+    let tree = RTree::bulk_load(points);
+    {
+        let mut t = data.tree.lock().unwrap();
+        *t = tree;
+    }
+    HttpResponse::Ok().body("ok")
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     debug_log!("starting server");
     let base_path = "partition";
-    let points = load_points_from_dir(base_path);
+    let points = load_points_from_dir(base_path, None, None);
     debug_log!("loaded {} points", points.len());
-    let tree = RTree::bulk_load(points);
+    let tree = Arc::new(Mutex::new(RTree::bulk_load(points)));
     let data = web::Data::new(AppState { tree });
 
     HttpServer::new(move || {
@@ -261,6 +295,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(data.clone())
             .service(index)
             .service(tile)
+            .service(range)
             .service(fs::Files::new("/lib", "./www/lib"))
     })
     .bind(("0.0.0.0", 8080))?
