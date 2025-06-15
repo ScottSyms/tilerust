@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::path::Path;
+use chrono::{DateTime, Duration, NaiveDateTime, TimeZone, Utc};
 use actix_files as fs;
 use actix_web::{get, web, App, HttpResponse, HttpServer, Responder};
 use parquet::file::reader::{FileReader, SerializedFileReader};
@@ -109,7 +110,9 @@ fn color_map(v: f32) -> Rgba<u8> {
 }
 
 fn load_points_from_dir<P: AsRef<Path>>(dir: P) -> Vec<DataPoint> {
-    let mut points = Vec::new();
+    let mut all_points: Vec<(DataPoint, DateTime<Utc>)> = Vec::new();
+    let mut max_time: Option<DateTime<Utc>> = None;
+
     for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
         if entry
             .path()
@@ -125,7 +128,12 @@ fn load_points_from_dir<P: AsRef<Path>>(dir: P) -> Vec<DataPoint> {
                             if let Ok(row) = record {
                                 let x = get_f64_by_name(&row, "longitude").unwrap_or(0.0);
                                 let y = get_f64_by_name(&row, "latitude").unwrap_or(0.0);
-                                points.push(DataPoint { x, y });
+                                if let Some(ts) = get_datetime_by_name(&row, "BaseDateTime") {
+                                    if max_time.map(|m| ts > m).unwrap_or(true) {
+                                        max_time = Some(ts);
+                                    }
+                                    all_points.push((DataPoint { x, y }, ts));
+                                }
                             }
                         }
                     }
@@ -133,7 +141,16 @@ fn load_points_from_dir<P: AsRef<Path>>(dir: P) -> Vec<DataPoint> {
             }
         }
     }
-    points
+    if let Some(max_time) = max_time {
+        let cutoff = max_time - Duration::hours(24);
+        all_points
+            .into_iter()
+            .filter(|(_, ts)| *ts >= cutoff)
+            .map(|(pt, _)| pt)
+            .collect()
+    } else {
+        Vec::new()
+    }
 }
 
 fn get_f64_by_name(row: &parquet::record::Row, name: &str) -> Option<f64> {
@@ -146,6 +163,34 @@ fn get_f64_by_name(row: &parquet::record::Row, name: &str) -> Option<f64> {
                 Field::Long(v) => Some(*v as f64),
                 Field::UInt(v) => Some(*v as f64),
                 Field::ULong(v) => Some(*v as f64),
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
+fn get_datetime_by_name(row: &parquet::record::Row, name: &str) -> Option<DateTime<Utc>> {
+    for (n, field) in row.get_column_iter() {
+        if n == name {
+            return match field {
+                Field::TimestampMillis(v) => DateTime::from_timestamp_millis(*v).map(|dt| dt.with_timezone(&Utc)),
+                Field::TimestampMicros(v) => DateTime::from_timestamp_micros(*v).map(|dt| dt.with_timezone(&Utc)),
+                Field::Int(v) => DateTime::from_timestamp(*v as i64, 0).map(|dt| dt.with_timezone(&Utc)),
+                Field::Long(v) => DateTime::from_timestamp(*v, 0).map(|dt| dt.with_timezone(&Utc)),
+                Field::Date(v) => {
+                    NaiveDateTime::from_timestamp_opt((*v as i64) * 86_400, 0)
+                        .map(|nd| Utc.from_utc_datetime(&nd))
+                }
+                Field::Str(s) => {
+                    DateTime::parse_from_rfc3339(s)
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .or_else(|_| {
+                            NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+                                .map(|nd| Utc.from_utc_datetime(&nd))
+                        })
+                        .ok()
+                }
                 _ => None,
             };
         }

@@ -12,3 +12,4 @@ parquet = "55"
 serde = { version = "1", features = ["derive"] }
 serde_derive = "1"
 walkdir = "2"
+chrono = { version = "0.4", default-features = false, features = ["alloc", "std"] }
