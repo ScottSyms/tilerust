@@ -1,4 +1,5 @@
 use std::fs::File;
+use std::path::Path;
 use actix_files as fs;
 use actix_web::{get, web, App, HttpResponse, HttpServer, Responder};
 use parquet::file::reader::{FileReader, SerializedFileReader};
@@ -6,12 +7,11 @@ use parquet::record::Field;
 use rstar::{RTree, RTreeObject, AABB};
 use image::{ImageBuffer, Rgba};
 use serde::Deserialize;
+use walkdir::WalkDir;
 
 #[derive(Clone, Copy, Debug, Deserialize)]
 struct DataPoint {
-    #[serde(rename = "X")]
     x: f64,
-    #[serde(rename = "Y")]
     y: f64,
 }
 
@@ -24,7 +24,7 @@ impl RTreeObject for DataPoint {
 }
 
 struct AppState {
-    tree: RTree<DataPoint>,
+    base_path: String,
 }
 
 fn tile2mercator(xtile: u32, ytile: u32, zoom: u32) -> (f64, f64) {
@@ -108,6 +108,34 @@ fn color_map(v: f32) -> Rgba<u8> {
     Rgba([r, 0, b, 255])
 }
 
+fn load_points_from_dir<P: AsRef<Path>>(dir: P) -> Vec<DataPoint> {
+    let mut points = Vec::new();
+    for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
+        if entry
+            .path()
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("parquet"))
+            .unwrap_or(false)
+        {
+            if let Ok(file) = File::open(entry.path()) {
+                if let Ok(reader) = SerializedFileReader::new(file) {
+                    if let Ok(iter) = reader.get_row_iter(None) {
+                        for record in iter {
+                            if let Ok(row) = record {
+                                let x = get_f64_by_name(&row, "longitude").unwrap_or(0.0);
+                                let y = get_f64_by_name(&row, "latitude").unwrap_or(0.0);
+                                points.push(DataPoint { x, y });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    points
+}
+
 fn get_f64_by_name(row: &parquet::record::Row, name: &str) -> Option<f64> {
     for (n, field) in row.get_column_iter() {
         if n == name {
@@ -133,26 +161,17 @@ async fn index() -> impl Responder {
 #[get("/tiles/{zoom}/{x}/{y}.png")]
 async fn tile(path: web::Path<(u32, u32, u32)>, data: web::Data<AppState>) -> HttpResponse {
     let (z, x, y) = path.into_inner();
-    let img = generate_tile(z, x, y, &data.tree);
+    let points = load_points_from_dir(&data.base_path);
+    let tree = RTree::bulk_load(points);
+    let img = generate_tile(z, x, y, &tree);
     HttpResponse::Ok().content_type("image/png").body(img)
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let file = File::open("data/stored.parquet").expect("data/stored.parquet not found");
-    let reader = SerializedFileReader::new(file).expect("failed to open parquet");
-    let iter = reader.get_row_iter(None).expect("unable to iterate parquet");
-    let mut points = Vec::new();
-    for record in iter {
-        if let Ok(row) = record {
-            let x = get_f64_by_name(&row, "X").unwrap_or(0.0);
-            let y = get_f64_by_name(&row, "Y").unwrap_or(0.0);
-            points.push(DataPoint { x, y });
-        }
-    }
-
-    let tree = RTree::bulk_load(points);
-    let data = web::Data::new(AppState { tree });
+    let data = web::Data::new(AppState {
+        base_path: String::from("partition"),
+    });
 
     HttpServer::new(move || {
         App::new()
